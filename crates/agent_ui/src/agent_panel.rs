@@ -43,12 +43,15 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown,
     OpenAgentDiff, ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell,
-    ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleAgentFocusMode, ToggleNewThreadMenu,
+    ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
@@ -94,8 +97,9 @@ use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, ThreadItem, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -346,6 +350,14 @@ enum AgentPanelEntryKind {
     Terminal,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentLayoutMode {
+    #[default]
+    Panel,
+    Focus,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct SerializedAgentPanel {
     selected_agent: Option<Agent>,
@@ -461,6 +473,14 @@ pub fn init(cx: &mut App) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
                             panel.toggle_options_menu(&ToggleOptionsMenu, window, cx);
+                        });
+                    }
+                })
+                .register_action(|workspace, _: &ToggleAgentFocusMode, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| {
+                            panel.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
                         });
                     }
                 })
@@ -1173,6 +1193,7 @@ pub struct AgentPanel {
     focus_handle: FocusHandle,
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
+    layout_mode: AgentLayoutMode,
     overlay_view: Option<OverlayView>,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1568,6 +1589,7 @@ impl AgentPanel {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
+            layout_mode: AgentLayoutMode::Panel,
             overlay_view: None,
             workspace,
             user_store,
@@ -3562,6 +3584,27 @@ impl AgentPanel {
     ) {
         window.focus(&self.focus_handle, cx);
         self.agent_panel_menu_handle.toggle(window, cx);
+    }
+
+    pub fn toggle_agent_focus_mode(
+        &mut self,
+        _: &ToggleAgentFocusMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.layout_mode = match self.layout_mode {
+            AgentLayoutMode::Panel => {
+                if !self.zoomed {
+                    if !self.focus_handle(cx).contains_focused(window, cx) {
+                        cx.focus_self(window);
+                    }
+                    cx.emit(PanelEvent::ZoomIn);
+                }
+                AgentLayoutMode::Focus
+            }
+            AgentLayoutMode::Focus => AgentLayoutMode::Panel,
+        };
+        cx.notify();
     }
 
     pub fn toggle_new_thread_menu(
@@ -5706,6 +5749,10 @@ impl AgentPanel {
             .is_some();
 
         let workspace = self.workspace.clone();
+        let focus_mode_label = match self.layout_mode {
+            AgentLayoutMode::Panel => "Enter Agent Focus Mode",
+            AgentLayoutMode::Focus => "Exit Agent Focus Mode",
+        };
 
         PopoverMenu::new("agent-options-menu")
             .trigger_with_tooltip(
@@ -5824,6 +5871,7 @@ impl AgentPanel {
                         }
 
                         menu = menu
+                            .action(focus_mode_label, Box::new(ToggleAgentFocusMode))
                             .action("Settings", Box::new(OpenSettings))
                             .separator()
                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
@@ -6422,6 +6470,410 @@ impl AgentPanel {
         )
     }
 
+    fn render_agent_focus_mode(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let editor_background = cx.theme().colors().editor_background;
+        let panel_background = cx.theme().colors().panel_background;
+
+        h_flex()
+            .id("agent-focus-mode")
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .bg(editor_background)
+            .child(self.render_agent_focus_task_sidebar(window, cx))
+            .child(
+                v_flex()
+                    .id("agent-focus-canvas")
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .size_full()
+                    .bg(panel_background)
+                    .child(self.render_agent_focus_surface(window, cx)),
+            )
+            .child(self.render_agent_focus_context_sidebar(window, cx))
+    }
+
+    fn render_agent_focus_surface(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match self.visible_surface() {
+            VisibleSurface::Uninitialized if !self.has_open_project(cx) => v_flex()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(self.render_no_project_state(cx))
+                .into_any_element(),
+            VisibleSurface::Uninitialized => div().flex_1().size_full().into_any_element(),
+            VisibleSurface::AgentThread(conversation_view) => v_flex()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(conversation_view.clone())
+                .child(self.render_drag_target(cx))
+                .into_any_element(),
+            VisibleSurface::Terminal(terminal_view) => v_flex()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(terminal_view.clone())
+                .child(self.render_drag_target(cx))
+                .into_any_element(),
+            VisibleSurface::Configuration(configuration) => v_flex()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .children(configuration.cloned())
+                .into_any_element(),
+        }
+    }
+
+    fn render_agent_focus_task_sidebar(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border_color = cx.theme().colors().border;
+        let panel_background = cx.theme().colors().panel_background;
+        let editor_background = cx.theme().colors().editor_background;
+        let active_thread_id = self.active_thread_id(cx);
+        let mut threads = ThreadMetadataStore::try_global(cx)
+            .map(|store| {
+                store
+                    .read(cx)
+                    .entries()
+                    .filter(|thread| !thread.archived)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        threads.sort_by_key(|thread| {
+            std::cmp::Reverse(
+                thread
+                    .interacted_at
+                    .as_ref()
+                    .unwrap_or(&thread.updated_at)
+                    .clone(),
+            )
+        });
+
+        let rows = threads
+            .into_iter()
+            .take(24)
+            .map(|thread| self.render_agent_focus_thread_item(thread, active_thread_id, cx))
+            .collect::<Vec<_>>();
+        let is_empty = rows.is_empty();
+
+        v_flex()
+            .id("agent-focus-task-sidebar")
+            .flex_none()
+            .w(px(280.))
+            .min_w(px(220.))
+            .max_w(px(340.))
+            .h_full()
+            .border_r_1()
+            .border_color(border_color)
+            .bg(panel_background)
+            .child(
+                h_flex()
+                    .h(Tab::content_height(cx))
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        Label::new("Tasks")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("agent-focus-new-task", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New Agent Thread"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_thread(&NewThread, window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .mx_2()
+                    .mb_1()
+                    .h_7()
+                    .gap_1()
+                    .px_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(border_color)
+                    .bg(editor_background)
+                    .child(Icon::new(IconName::MagnifyingGlass).color(Color::Muted))
+                    .child(
+                        Label::new("Search tasks")
+                            .size(LabelSize::Small)
+                            .color(Color::Placeholder),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_1()
+                    .py_1()
+                    .gap_0p5()
+                    .children(rows)
+                    .when(is_empty, |this| {
+                        this.child(
+                            v_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .px_3()
+                                .child(Icon::new(IconName::Thread).color(Color::Muted))
+                                .child(
+                                    Label::new("No agent threads")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent_focus_thread_item(
+        &self,
+        metadata: ThreadMetadata,
+        active_thread_id: Option<ThreadId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let thread_id = metadata.thread_id;
+        let selected = active_thread_id == Some(thread_id);
+        let timestamp = {
+            let timestamp = metadata
+                .interacted_at
+                .as_ref()
+                .unwrap_or(&metadata.updated_at);
+            format_timestamp_human(timestamp)
+        };
+        let agent = Agent::from(metadata.agent_id.clone());
+        let icon = agent.icon().unwrap_or(IconName::ZedAgent);
+        let icon_from_external_svg = match &agent {
+            Agent::Custom { id, .. } => {
+                let agent_server_store = self.project.read(cx).agent_server_store().clone();
+                agent_server_store.read(cx).agent_icon(id)
+            }
+            Agent::NativeAgent => None,
+            #[cfg(any(test, feature = "test-support"))]
+            Agent::Stub => None,
+        };
+        let status = if selected {
+            self.active_thread_status(cx)
+        } else {
+            AgentThreadStatus::Completed
+        };
+        let panel = cx.entity();
+        let metadata_for_click = metadata.clone();
+
+        ThreadItem::new(
+            format!("agent-focus-thread-{}", thread_id.to_key_string()),
+            metadata.display_title(),
+        )
+        .icon(icon)
+        .when_some(icon_from_external_svg, |this, svg| {
+            this.custom_icon_from_external_svg(svg)
+        })
+        .timestamp(timestamp)
+        .project_paths(metadata.folder_paths().paths_owned())
+        .selected(selected)
+        .rounded(true)
+        .status(status)
+        .on_click(move |_, window, cx| {
+            let metadata = metadata_for_click.clone();
+            panel
+                .update(cx, |panel, cx| {
+                    panel.load_agent_thread(
+                        Agent::from(metadata.agent_id.clone()),
+                        metadata.thread_id,
+                        Some(metadata.folder_paths().clone()),
+                        metadata.title(),
+                        true,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+        })
+        .into_any_element()
+    }
+
+    fn active_thread_status(&self, cx: &App) -> AgentThreadStatus {
+        let Some(conversation_view) = self.active_conversation_view() else {
+            return AgentThreadStatus::Completed;
+        };
+        let conversation_view = conversation_view.read(cx);
+        if conversation_view.is_loading() {
+            return AgentThreadStatus::Running;
+        }
+        if conversation_view.root_thread_has_pending_tool_call(cx) {
+            return AgentThreadStatus::WaitingForConfirmation;
+        }
+        let Some(thread_view) = conversation_view.root_thread_view() else {
+            return AgentThreadStatus::Completed;
+        };
+        let thread_view = thread_view.read(cx);
+        let thread = thread_view.thread.read(cx);
+        if thread.had_error() {
+            AgentThreadStatus::Error
+        } else {
+            match thread.status() {
+                ThreadStatus::Generating => AgentThreadStatus::Running,
+                ThreadStatus::Idle => AgentThreadStatus::Completed,
+            }
+        }
+    }
+
+    fn render_agent_focus_context_sidebar(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border_color = cx.theme().colors().border;
+        let panel_background = cx.theme().colors().panel_background;
+        let worktrees = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .take(8)
+            .map(|worktree| worktree.read(cx).root_name_str().to_string())
+            .collect::<Vec<_>>();
+        let active_title = self
+            .active_conversation_view()
+            .map(|conversation_view| conversation_view.read(cx).title(cx));
+        let active_status = self
+            .active_thread_id(cx)
+            .map(|_| self.active_thread_status(cx));
+
+        v_flex()
+            .id("agent-focus-context-sidebar")
+            .flex_none()
+            .w(px(300.))
+            .min_w(px(240.))
+            .max_w(px(360.))
+            .h_full()
+            .border_l_1()
+            .border_color(border_color)
+            .bg(panel_background)
+            .child(
+                h_flex()
+                    .h(Tab::content_height(cx))
+                    .px_2()
+                    .justify_between()
+                    .child(
+                        Label::new("Context")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("agent-focus-review-changes", IconName::ListTodo)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Review Changes"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenAgentDiff), cx);
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .py_1()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Label::new("Current Task")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(match active_title {
+                                Some(title) => Label::new(title).truncate().into_any_element(),
+                                None => Label::new("No active task")
+                                    .color(Color::Muted)
+                                    .into_any_element(),
+                            })
+                            .when_some(active_status, |this, status| {
+                                this.child(
+                                    Label::new(match status {
+                                        AgentThreadStatus::Completed => "Done",
+                                        AgentThreadStatus::Running => "Running",
+                                        AgentThreadStatus::WaitingForConfirmation => "Waiting",
+                                        AgentThreadStatus::Error => "Error",
+                                    })
+                                    .size(LabelSize::Small)
+                                    .color(match status {
+                                        AgentThreadStatus::Completed => Color::Muted,
+                                        AgentThreadStatus::Running => Color::Accent,
+                                        AgentThreadStatus::WaitingForConfirmation => Color::Warning,
+                                        AgentThreadStatus::Error => Color::Error,
+                                    }),
+                                )
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Label::new("Files")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .children(worktrees.into_iter().map(|name| {
+                                h_flex()
+                                    .gap_1()
+                                    .min_w_0()
+                                    .child(Icon::new(IconName::Folder).color(Color::Muted))
+                                    .child(Label::new(name).truncate())
+                                    .into_any_element()
+                            })),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Label::new("Changes")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Icon::new(IconName::Diff).color(Color::Muted))
+                                    .child(
+                                        Label::new("Review diff")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_drag_target(&self, cx: &Context<Self>) -> Div {
         let is_local = self.project.read(cx).is_local();
         div()
@@ -6606,6 +7058,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::manage_skills))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::toggle_options_menu))
+            .on_action(cx.listener(Self::toggle_agent_focus_mode))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
@@ -6626,20 +7079,23 @@ impl Render for AgentPanel {
             }))
             .child(self.render_toolbar(window, cx))
             .children(self.render_new_user_onboarding(window, cx))
-            .map(|parent| match self.visible_surface() {
-                VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
-                    parent.child(self.render_no_project_state(cx))
-                }
-                VisibleSurface::Uninitialized => parent,
-                VisibleSurface::AgentThread(conversation_view) => parent
-                    .child(conversation_view.clone())
-                    .child(self.render_drag_target(cx)),
-                VisibleSurface::Terminal(terminal_view) => parent
-                    .child(terminal_view.clone())
-                    .child(self.render_drag_target(cx)),
-                VisibleSurface::Configuration(configuration) => {
-                    parent.children(configuration.cloned())
-                }
+            .map(|parent| match self.layout_mode {
+                AgentLayoutMode::Panel => match self.visible_surface() {
+                    VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
+                        parent.child(self.render_no_project_state(cx))
+                    }
+                    VisibleSurface::Uninitialized => parent,
+                    VisibleSurface::AgentThread(conversation_view) => parent
+                        .child(conversation_view.clone())
+                        .child(self.render_drag_target(cx)),
+                    VisibleSurface::Terminal(terminal_view) => parent
+                        .child(terminal_view.clone())
+                        .child(self.render_drag_target(cx)),
+                    VisibleSurface::Configuration(configuration) => {
+                        parent.children(configuration.cloned())
+                    }
+                },
+                AgentLayoutMode::Focus => parent.child(self.render_agent_focus_mode(window, cx)),
             })
             .children(self.render_trial_end_upsell(window, cx));
 
